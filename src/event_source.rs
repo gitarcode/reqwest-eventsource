@@ -1,7 +1,7 @@
 use crate::error::{CannotCloneRequestError, Error};
+use crate::parser::{ParserRegistry, ParserRegistryBuilder};
 use crate::retry::{RetryPolicy, DEFAULT_RETRY};
 use core::pin::Pin;
-use eventsource_stream::Eventsource;
 pub use eventsource_stream::{Event as MessageEvent, EventStreamError};
 #[cfg(not(target_arch = "wasm32"))]
 use futures_core::future::BoxFuture;
@@ -14,6 +14,7 @@ use futures_core::stream::BoxStream;
 use futures_core::stream::LocalBoxStream;
 use futures_core::stream::Stream;
 use futures_core::task::{Context, Poll};
+use futures_util::StreamExt;
 use futures_timer::Delay;
 use pin_project_lite::pin_project;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -59,16 +60,25 @@ pub struct EventSource {
     is_closed: bool,
     retry_policy: BoxedRetry,
     last_event_id: String,
-    last_retry: Option<(usize, Duration)>
+    last_retry: Option<(usize, Duration)>,
+    parser_registry: ParserRegistry
 }
 }
 
 impl EventSource {
-    /// Wrap a [`RequestBuilder`]
+    /// Wrap a [`RequestBuilder`] with default parsers
     pub fn new(builder: RequestBuilder) -> Result<Self, CannotCloneRequestError> {
+        let registry = ParserRegistryBuilder::new().with_default_parsers().build();
+        Self::with_parser_registry(builder, registry)
+    }
+    
+    /// Wrap a [`RequestBuilder`] with a custom parser registry
+    pub fn with_parser_registry(builder: RequestBuilder, parser_registry: ParserRegistry) -> Result<Self, CannotCloneRequestError> {
+        // Build accept header from supported content types
+        let accept_types = parser_registry.supported_content_types().join(", ");
         let builder = builder.header(
             reqwest::header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
+            HeaderValue::from_str(&accept_types).unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
         );
         let res_future = Box::pin(builder.try_clone().ok_or(CannotCloneRequestError)?.send());
         Ok(Self {
@@ -80,6 +90,7 @@ impl EventSource {
             retry_policy: Box::new(DEFAULT_RETRY),
             last_event_id: String::new(),
             last_retry: None,
+            parser_registry,
         })
     }
 
@@ -115,7 +126,7 @@ impl EventSource {
     }
 }
 
-fn check_response(response: Response) -> Result<Response, Error> {
+fn check_response(response: Response, parser_registry: &ParserRegistry) -> Result<Response, Error> {
     match response.status() {
         StatusCode::OK => {}
         status => {
@@ -124,28 +135,22 @@ fn check_response(response: Response) -> Result<Response, Error> {
     }
     let content_type =
         if let Some(content_type) = response.headers().get(&reqwest::header::CONTENT_TYPE) {
-            content_type
+            content_type.to_str().unwrap_or("")
         } else {
             return Err(Error::InvalidContentType(
                 HeaderValue::from_static(""),
                 response,
             ));
         };
-    if content_type
-        .to_str()
-        .map_err(|_| ())
-        .and_then(|s| s.parse::<mime::Mime>().map_err(|_| ()))
-        .map(|mime_type| {
-            matches!(
-                (mime_type.type_(), mime_type.subtype()),
-                (mime::TEXT, mime::EVENT_STREAM)
-            )
-        })
-        .unwrap_or(false)
-    {
+        
+    // Check if any parser can handle this content type
+    if parser_registry.find_parser(content_type).is_some() {
         Ok(response)
     } else {
-        Err(Error::InvalidContentType(content_type.clone(), response))
+        Err(Error::InvalidContentType(
+            HeaderValue::from_str(content_type).unwrap_or_else(|_| HeaderValue::from_static("")), 
+            response
+        ))
     }
 }
 
@@ -167,11 +172,36 @@ impl<'a> EventSourceProjection<'a> {
         Ok(())
     }
 
-    fn handle_response(&mut self, res: Response) {
+    fn handle_response(&mut self, res: Response) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.last_retry.take();
-        let mut stream = res.bytes_stream().eventsource();
-        stream.set_last_event_id(self.last_event_id.clone());
-        self.cur_stream.replace(Box::pin(stream));
+        
+        // Get content type
+        let content_type = res.headers()
+            .get(&reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream");
+        
+        // Find appropriate parser
+        if let Some(parser) = self.parser_registry.find_parser(content_type) {
+            // Use the parser to create the stream
+            let parsed_stream = parser.parse(res)?;
+            
+            // Convert to the expected EventStream type
+            let mapped_stream = parsed_stream.map(|result| {
+                result.map_err(|e| {
+                    // Convert parser error to EventStreamError::Parser
+                    use nom::error::{Error as NomError, ErrorKind};
+                    EventStreamError::Parser(NomError::new(e.to_string(), ErrorKind::Fail))
+                })
+            });
+            
+            self.cur_stream.replace(Box::pin(mapped_stream));
+            
+            
+            Ok(())
+        } else {
+            Err(format!("No parser available for content type: {}", content_type).into())
+        }
     }
 
     fn handle_event(&mut self, event: &MessageEvent) {
@@ -235,10 +265,15 @@ impl Stream for EventSource {
             match response_future.poll(cx) {
                 Poll::Ready(Ok(res)) => {
                     this.clear_fetch();
-                    match check_response(res) {
+                    match check_response(res, this.parser_registry) {
                         Ok(res) => {
-                            this.handle_response(res);
-                            return Poll::Ready(Some(Ok(Event::Open)));
+                            match this.handle_response(res) {
+                                Ok(()) => return Poll::Ready(Some(Ok(Event::Open))),
+                                Err(err) => {
+                                    *this.is_closed = true;
+                                    return Poll::Ready(Some(Err(Error::ParseError(err.to_string()))));
+                                }
+                            }
                         }
                         Err(err) => {
                             *this.is_closed = true;
@@ -257,6 +292,7 @@ impl Stream for EventSource {
             }
         }
 
+        // All content types are now handled by their respective parsers
         match this
             .cur_stream
             .as_mut()

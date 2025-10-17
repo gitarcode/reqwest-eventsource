@@ -47,6 +47,9 @@ pub enum Error {
     /// The stream ended
     #[error("Stream ended")]
     StreamEnded,
+    /// Parser error
+    #[error("Parse error: {0}")]
+    ParseError(String),
 }
 
 impl From<EventStreamError<ReqwestError>> for Error {

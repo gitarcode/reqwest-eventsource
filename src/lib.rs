@@ -27,7 +27,11 @@ mod error;
 mod event_source;
 mod reqwest_ext;
 pub mod retry;
+#[cfg(feature = "amazon-eventstream")]
+mod amazon_eventstream;
+pub mod parser;
 
 pub use error::{CannotCloneRequestError, Error};
 pub use event_source::{Event, EventSource, ReadyState};
 pub use reqwest_ext::RequestBuilderExt;
+pub use parser::{ContentParser, ParserRegistry, ParserRegistryBuilder};
