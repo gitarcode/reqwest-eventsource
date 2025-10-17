@@ -17,11 +17,19 @@ categories = ["web-programming::http-client", "no-std", "parsing", "asynchronous
 eventsource-stream = "0.2.3"
 reqwest = { version = "0.12.0", default-features = false, features = ["stream"] }
 futures-core = "0.3.5"
+futures-util = "0.3.5"
 pin-project-lite = "0.2.8"
 nom = "7.1.0"
 mime = "0.3.16"
 futures-timer = "3.0.2"
 thiserror = "1.0.30"
+serde_json = { version = "1", optional = true }
+base64 = { version = "0", optional = true }
+tracing = { version = "0", optional = true }
+
+[features]
+default = ["amazon-eventstream"]
+amazon-eventstream = ["serde_json", "base64", "tracing"]
 
 [dev-dependencies]
 futures = "0.3.5"
@@ -29,3 +37,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-retry = "0.6"
 pin-utils = "0.1"
 rocket = "0.5.0"
+
+[[example]]
+name = "amazon_eventstream"
+required-features = []
+
+[[example]]
+name = "custom_parser" 
+required-features = []
